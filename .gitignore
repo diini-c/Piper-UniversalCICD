@@ -12,3 +12,9 @@ dist/
 build/
 *.egg-info/
 .pipeline/
+.coverage
+coverage.xml
+htmlcov/
+
+# piper's own output
+test_report.json

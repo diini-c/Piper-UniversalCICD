@@ -1,7 +1,22 @@
 exclude: |
-  ^(venv/|\.venv/|build/|dist/|.*\.egg-info/|\.mypy_cache/|\.ruff_cache/)
+  (?x)^(
+    venv/|\.venv/|build/|dist/|.*\.egg-info/|\.mypy_cache/|\.ruff_cache/|\.pytest_cache/
+  )
 
 repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      # check-toml would have caught the duplicate [project.scripts] table that
+      # silently broke pip, ruff, black and pytest all at once.
+      - id: check-toml
+      - id: check-yaml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+
   - repo: https://github.com/psf/black
     rev: 24.8.0
     hooks:
@@ -11,6 +26,7 @@ repos:
     rev: v0.6.8
     hooks:
       - id: ruff
+        args: ["--fix"]
 
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.11.2
@@ -18,6 +34,11 @@ repos:
       - id: mypy
         args: ["--config-file=pyproject.toml"]
         files: ^(src/|tests/)
+        # mypy runs in an isolated env, so every import it must resolve is listed here.
         additional_dependencies:
-          - click>=8
-          - rich>=13
+          - click>=8.1
+          - rich>=13.7
+          - jinja2>=3.1
+          - pathspec>=1.0
+          - pytest>=8.0
+          - types-PyYAML>=6.0
