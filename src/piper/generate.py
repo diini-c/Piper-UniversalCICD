@@ -23,12 +23,31 @@ _DEFAULT_NODE_VERSIONS = ["20", "22"]
 _PROVIDER_OUTPUTS: dict[str, str] = {"github": ".github/workflows/ci.yml"}
 
 
-# Every step is rendered with this key set so StrictUndefined can stay enabled.
-_STEP_DEFAULTS: dict[str, Any] = {"uses": None, "run": None, "params": {}}
+# Every step and job is rendered with this key set so StrictUndefined can stay on.
+_STEP_DEFAULTS: dict[str, Any] = {"uses": None, "run": None, "params": {}, "step_id": None}
+_JOB_DEFAULTS: dict[str, Any] = {
+    "matrix": None,
+    "needs": None,
+    "if_expr": None,
+    "outputs": None,
+    "working_directory": None,
+}
 
 
 def _normalise_step(step: Mapping[str, Any]) -> dict[str, Any]:
     return {**_STEP_DEFAULTS, **step}
+
+
+def _normalise_job(job: Mapping[str, Any]) -> dict[str, Any]:
+    normalised = {**_JOB_DEFAULTS, **job}
+    normalised["steps"] = [_normalise_step(step) for step in normalised["steps"]]
+    return normalised
+
+
+def _slug(path: str) -> str:
+    """Turn a workspace path into a YAML-safe, unique job-id fragment."""
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").lower()
+    return cleaned or "root"
 
 
 def default_output_path(provider: str) -> str:
@@ -100,13 +119,36 @@ def _lint_steps(root: Path) -> list[dict[str, Any]]:
     return steps
 
 
-def _python_job(detection: Mapping[str, Any], root: Path) -> dict[str, Any]:
+def _cache_params(prefix: str, filename: str | None, manager: str) -> dict[str, str]:
+    """
+    Build the cache half of a setup-* action's `with:` block.
+
+    setup-python and setup-node are `uses` steps, so they never inherit a job's
+    defaults.run.working-directory. Inside a workspace the dependency file has to
+    be named from the repository root or the action caches the wrong tree — and
+    with no dependency file at all the action hard-fails, so caching is only
+    requested when there is something to key it on.
+    """
+    if filename is None:
+        return {}
+    path = f"{prefix}/{filename}" if prefix else filename
+    return {"cache": _quote(manager), "cache-dependency-path": _quote(path)}
+
+
+def _python_job(detection: Mapping[str, Any], root: Path, prefix: str = "") -> dict[str, Any]:
     versions = _python_versions(root)
+    dependency_file = next(
+        (name for name in ("requirements.txt", "pyproject.toml") if (root / name).exists()),
+        None,
+    )
     steps: list[dict[str, Any]] = [
         {
             "name": "Set up Python ${{ matrix.python-version }}",
             "uses": "actions/setup-python@v5",
-            "params": {"python-version": "${{ matrix.python-version }}", "cache": _quote("pip")},
+            "params": {
+                "python-version": "${{ matrix.python-version }}",
+                **_cache_params(prefix, dependency_file, "pip"),
+            },
         }
     ]
 
@@ -143,8 +185,16 @@ def _python_job(detection: Mapping[str, Any], root: Path) -> dict[str, Any]:
     }
 
 
-def _node_job(detection: Mapping[str, Any], root: Path) -> dict[str, Any]:
+def _node_job(detection: Mapping[str, Any], root: Path, prefix: str = "") -> dict[str, Any]:
     manager = str(detection.get("package_manager") or "npm")
+    lockfile = next(
+        (
+            name
+            for name in ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
+            if (root / name).exists()
+        ),
+        None,
+    )
     steps: list[dict[str, Any]] = []
 
     # setup-node can only cache pnpm once pnpm itself is on PATH.
@@ -161,7 +211,10 @@ def _node_job(detection: Mapping[str, Any], root: Path) -> dict[str, Any]:
         {
             "name": "Set up Node ${{ matrix.node-version }}",
             "uses": "actions/setup-node@v4",
-            "params": {"node-version": "${{ matrix.node-version }}", "cache": _quote(manager)},
+            "params": {
+                "node-version": "${{ matrix.node-version }}",
+                **_cache_params(prefix, lockfile, manager),
+            },
         }
     )
 
@@ -244,6 +297,83 @@ def _docker_job() -> dict[str, Any]:
     }
 
 
+def _jobs_for(detection: Mapping[str, Any], root: Path, prefix: str = "") -> list[dict[str, Any]]:
+    """Build the per-language jobs a single project directory implies."""
+    types = detection.get("types") or []
+    jobs: list[dict[str, Any]] = []
+    if "python" in types:
+        jobs.append(_python_job(detection, root, prefix))
+    if "node" in types:
+        jobs.append(_node_job(detection, root, prefix))
+    if "rust" in types:
+        jobs.append(_rust_job())
+    if "go" in types:
+        jobs.append(_go_job())
+    return jobs
+
+
+def _changes_job(paths_by_slug: dict[str, str]) -> dict[str, Any]:
+    """
+    A gate job that reports which workspaces a push or PR actually touched.
+
+    GitHub only supports path filters at workflow level, not per job, so the
+    filtering has to run as a job whose outputs the workspace jobs gate on. A
+    job skipped this way still reports a conclusion, which keeps it usable as a
+    required status check — a workflow-level `paths:` filter would report
+    nothing at all and leave branch protection waiting forever.
+    """
+    filters: list[str] = []
+    for slug, path in paths_by_slug.items():
+        filters.append(f"{slug}:")
+        filters.append(f"  - '{path}/**'")
+
+    return {
+        "id": "changes",
+        "name": "Detect changed workspaces",
+        "outputs": {slug: "${{ steps.filter.outputs." + slug + " }}" for slug in paths_by_slug},
+        "steps": [
+            {
+                "name": "Filter changed paths",
+                "uses": "dorny/paths-filter@v3",
+                "step_id": "filter",
+                "params": {"filters": filters},
+            }
+        ],
+    }
+
+
+def _workspace_jobs(
+    workspaces: list[Mapping[str, Any]], base: Path
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Build jobs for every nested project, plus the path map the gate needs."""
+    jobs: list[dict[str, Any]] = []
+    paths_by_slug: dict[str, str] = {}
+
+    for workspace in workspaces:
+        relative = str(workspace.get("root") or "").strip().strip("/")
+        if not relative or relative == ".":
+            continue
+
+        slug = _slug(relative)
+        built = _jobs_for(workspace, base / relative, relative)
+        if not built:
+            continue
+
+        for job in built:
+            job["id"] = f"{slug}_{job['id']}"
+            job["name"] = f"{relative} · {job['name']}"
+            # Only `run` steps inherit this; `uses` steps such as checkout still
+            # operate from the repository root, which is what they expect.
+            job["working_directory"] = relative
+            job["needs"] = "changes"
+            job["if_expr"] = f"needs.changes.outputs.{slug} == 'true'"
+            jobs.append(job)
+
+        paths_by_slug[slug] = relative
+
+    return jobs, paths_by_slug
+
+
 def build_context(
     detection: Mapping[str, Any],
     root: str = ".",
@@ -253,29 +383,24 @@ def build_context(
 ) -> dict[str, Any]:
     """Turn a detection result into the data the workflow template renders."""
     base = Path(root)
-    types = detection.get("types") or []
     signals = detection.get("signals") or {}
 
-    jobs: list[dict[str, Any]] = []
-    if "python" in types:
-        jobs.append(_python_job(detection, base))
-    if "node" in types:
-        jobs.append(_node_job(detection, base))
-    if "rust" in types:
-        jobs.append(_rust_job())
-    if "go" in types:
-        jobs.append(_go_job())
+    jobs = _jobs_for(detection, base)
     if signals.get("docker"):
         jobs.append(_docker_job())
 
-    for job in jobs:
-        job["steps"] = [_normalise_step(step) for step in job["steps"]]
+    # Nested projects each get their own job, gated on whether they changed, so a
+    # commit under one workspace does not rebuild every other one.
+    workspaces = detection.get("workspaces") or []
+    workspace_jobs, paths_by_slug = _workspace_jobs(workspaces, base)
+    if workspace_jobs:
+        jobs = [_changes_job(paths_by_slug), *jobs, *workspace_jobs]
 
     return {
         "workflow_name": workflow_name,
         "default_branch": default_branch,
         "version": version,
-        "jobs": jobs,
+        "jobs": [_normalise_job(job) for job in jobs],
     }
 
 
@@ -293,7 +418,11 @@ def render(
         known = ", ".join(sorted(PROVIDERS))
         raise PiperError(f"unknown provider {provider!r}; expected one of: {known}") from None
 
-    if not (detection.get("types") or detection.get("signals", {}).get("docker")):
+    if not (
+        detection.get("types")
+        or detection.get("signals", {}).get("docker")
+        or detection.get("workspaces")
+    ):
         raise PiperError(
             "no supported technology detected, so there is nothing to generate. "
             "Run `piper scan` to see what was found."

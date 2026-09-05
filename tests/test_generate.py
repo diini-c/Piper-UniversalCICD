@@ -211,3 +211,134 @@ def test_build_context_normalises_every_step(make_project: ProjectBuilder) -> No
     for job in context["jobs"]:
         for step in job["steps"]:
             assert {"name", "uses", "run", "params"} <= set(step)
+
+
+MONOREPO_DETECTION: dict[str, Any] = {
+    "types": ["node"],
+    "framework": "next",
+    "deploy": None,
+    "package_manager": "pnpm",
+    "test_runners": ["vitest"],
+    "signals": {"node": ["package.json"], "docker": []},
+    "workspaces": [
+        {
+            "root": "apps/web",
+            "types": ["node"],
+            "package_manager": "npm",
+            "test_runners": ["jest"],
+            "signals": {"node": ["package.json"], "docker": []},
+        },
+        {
+            "root": "services/api",
+            "types": ["python"],
+            "package_manager": None,
+            "test_runners": ["pytest"],
+            "signals": {"python": ["pyproject.toml"], "docker": []},
+        },
+    ],
+}
+
+
+@pytest.fixture
+def monorepo(make_project: ProjectBuilder) -> Path:
+    return make_project(
+        {
+            "package.json": {"name": "root"},
+            "pnpm-lock.yaml": "",
+            "apps/web/package.json": {"name": "web"},
+            "services/api/pyproject.toml": '[project]\nrequires-python = ">=3.12"\n',
+        }
+    )
+
+
+class TestWorkspaceJobs:
+    def test_each_workspace_gets_a_job(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        assert "apps_web_node" in workflow["jobs"]
+        assert "services_api_python" in workflow["jobs"]
+
+    def test_root_jobs_are_still_emitted(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        assert "node" in workflow["jobs"]
+
+    def test_workspace_job_runs_in_its_own_directory(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        job = workflow["jobs"]["apps_web_node"]
+        assert job["defaults"]["run"]["working-directory"] == "apps/web"
+
+    def test_root_job_has_no_working_directory(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        assert "defaults" not in workflow["jobs"]["node"]
+
+    def test_workspace_job_is_gated_on_the_changes_job(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        job = workflow["jobs"]["services_api_python"]
+        assert job["needs"] == "changes"
+        assert job["if"] == "needs.changes.outputs.services_api == 'true'"
+
+    def test_gate_declares_an_output_per_workspace(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        outputs = workflow["jobs"]["changes"]["outputs"]
+        assert set(outputs) == {"apps_web", "services_api"}
+        assert outputs["apps_web"] == "${{ steps.filter.outputs.apps_web }}"
+
+    def test_gate_filters_on_each_workspace_path(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        step = workflow["jobs"]["changes"]["steps"][1]
+        assert step["uses"] == "dorny/paths-filter@v3"
+        assert step["id"] == "filter"
+        # The filters value is a YAML document nested inside a block scalar.
+        filters = yaml.safe_load(step["with"]["filters"])
+        assert filters == {"apps_web": ["apps/web/**"], "services_api": ["services/api/**"]}
+
+    def test_gate_is_absent_without_workspaces(self, make_project: ProjectBuilder) -> None:
+        root = make_project({"pyproject.toml": "[project]\n"})
+        workflow = _load(render(PYTHON_DETECTION, root=str(root)))
+        assert "changes" not in workflow["jobs"]
+
+    def test_workspace_python_matrix_comes_from_its_own_pyproject(self, monorepo: Path) -> None:
+        """The root declares no floor; services/api pins >=3.12 and must win."""
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        matrix = workflow["jobs"]["services_api_python"]["strategy"]["matrix"]
+        assert matrix["python-version"] == ["3.12", "3.13"]
+
+    def test_workspace_root_that_is_dot_is_skipped(self, monorepo: Path) -> None:
+        detection = {**MONOREPO_DETECTION, "workspaces": [{"root": ".", "types": ["node"]}]}
+        workflow = _load(render(detection, root=str(monorepo)))
+        assert "changes" not in workflow["jobs"]
+
+    def test_workspace_without_recognised_types_is_skipped(self, monorepo: Path) -> None:
+        detection = {**MONOREPO_DETECTION, "workspaces": [{"root": "docs", "types": []}]}
+        workflow = _load(render(detection, root=str(monorepo)))
+        assert "changes" not in workflow["jobs"]
+
+    def test_job_ids_are_yaml_safe(self, make_project: ProjectBuilder) -> None:
+        root = make_project({"package.json": {"name": "r"}, "a-b.c/d/package.json": {"name": "x"}})
+        detection = {
+            **MONOREPO_DETECTION,
+            "workspaces": [{"root": "a-b.c/d", "types": ["node"], "signals": {"docker": []}}],
+        }
+        workflow = _load(render(detection, root=str(root)))
+        assert "a_b_c_d_node" in workflow["jobs"]
+
+
+class TestSetupCaching:
+    """setup-* are `uses` steps, so they never inherit working-directory."""
+
+    def test_workspace_cache_path_is_repo_relative(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        setup = workflow["jobs"]["services_api_python"]["steps"][1]
+        assert setup["with"]["cache-dependency-path"] == "services/api/pyproject.toml"
+
+    def test_root_cache_path_has_no_prefix(self, monorepo: Path) -> None:
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        setup = workflow["jobs"]["node"]["steps"][2]
+        assert setup["with"]["cache-dependency-path"] == "pnpm-lock.yaml"
+
+    def test_no_cache_requested_without_a_lockfile(self, monorepo: Path) -> None:
+        """setup-node hard-fails on `cache:` when it can find no lockfile to key on."""
+        setup = _load(render(MONOREPO_DETECTION, root=str(monorepo)))["jobs"]["apps_web_node"][
+            "steps"
+        ][1]
+        assert "cache" not in setup["with"]
+        assert "cache-dependency-path" not in setup["with"]

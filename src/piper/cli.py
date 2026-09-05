@@ -101,6 +101,12 @@ def test_command(root: str, dry_run: bool) -> None:
     is_flag=True,
     help="Exit non-zero if the file on disk differs from what piper would generate",
 )
+@click.option(
+    "--depth",
+    default=2,
+    show_default=True,
+    help="How deep to search for nested projects to give their own jobs",
+)
 @handle_errors
 def generate_command(
     root: str,
@@ -110,9 +116,10 @@ def generate_command(
     branch: str,
     to_stdout: bool,
     check: bool,
+    depth: int,
 ) -> None:
     """Generate a CI pipeline that matches the detected stack."""
-    detection = do_scan(root, depth=0)
+    detection = do_scan(root, depth=depth)
 
     if to_stdout:
         click.echo(render(detection, provider, root, workflow_name, branch), nl=False)

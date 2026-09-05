@@ -59,10 +59,32 @@ piper generate                     # writes .github/workflows/ci.yml
 piper generate --stdout            # print instead of writing
 piper generate --name Build --branch develop
 piper generate --check             # fail if the file on disk is out of date
+piper generate --depth 0           # root only, ignore nested projects
 ```
 
 `--check` is intended for CI: it exits non-zero when the committed pipeline no
 longer matches the project, which catches a stack change that nobody regenerated.
+
+#### Monorepos
+
+Every nested project found by `scan` gets its own job, running in its own
+directory and gated on whether that directory actually changed:
+
+```yaml
+  services_api_python:
+    name: services/api · Python
+    needs: changes
+    if: needs.changes.outputs.services_api == 'true'
+    defaults:
+      run:
+        working-directory: services/api
+```
+
+The gate is a `changes` job using `dorny/paths-filter`. GitHub only supports
+path filters at workflow level, never per job, so the filtering has to run as a
+job the others depend on. A job skipped this way still reports a conclusion,
+which keeps it usable as a required status check — a workflow-level `paths:`
+filter would report nothing at all and leave branch protection waiting forever.
 
 ## What gets detected
 

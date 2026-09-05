@@ -15,6 +15,23 @@ jobs:
   {{ job.id }}:
     name: {{ job.name }}
     runs-on: ubuntu-latest
+    {%- if job.needs %}
+    needs: {{ job.needs }}
+    {%- endif %}
+    {%- if job.if_expr %}
+    if: {{ job.if_expr }}
+    {%- endif %}
+    {%- if job.outputs %}
+    outputs:
+      {%- for key, value in job.outputs.items() %}
+      {{ key }}: {{ value }}
+      {%- endfor %}
+    {%- endif %}
+    {%- if job.working_directory %}
+    defaults:
+      run:
+        working-directory: {{ job.working_directory }}
+    {%- endif %}
     {%- if job.matrix %}
     strategy:
       fail-fast: false
@@ -25,12 +42,22 @@ jobs:
       - uses: actions/checkout@v4
       {%- for step in job.steps %}
       - name: {{ step.name }}
+        {%- if step.step_id %}
+        id: {{ step.step_id }}
+        {%- endif %}
         {%- if step.uses %}
         uses: {{ step.uses }}
         {%- if step.params %}
         with:
           {%- for key, value in step.params.items() %}
+          {%- if value is string %}
           {{ key }}: {{ value }}
+          {%- else %}
+          {{ key }}: |
+            {%- for line in value %}
+            {{ line }}
+            {%- endfor %}
+          {%- endif %}
           {%- endfor %}
         {%- endif %}
         {%- else %}
