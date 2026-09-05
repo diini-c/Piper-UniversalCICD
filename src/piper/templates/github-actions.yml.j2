@@ -39,7 +39,7 @@ jobs:
         {{ job.matrix.key }}: [{{ job.matrix.options | join(', ') }}]
     {%- endif %}
     steps:
-      - uses: actions/checkout@v4
+      - uses: {{ checkout_action }}
       {%- for step in job.steps %}
       - name: {{ step.name }}
         {%- if step.step_id %}

@@ -10,7 +10,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from .errors import PiperError
 
-__all__ = ["PROVIDERS", "build_context", "render", "generate", "default_output_path"]
+__all__ = ["ACTIONS", "PROVIDERS", "build_context", "render", "generate", "default_output_path"]
 
 PROVIDERS: dict[str, str] = {"github": "github-actions.yml.j2"}
 
@@ -21,6 +21,25 @@ _LATEST_PYTHON_MINOR = 13
 _DEFAULT_NODE_VERSIONS = ["20", "22"]
 
 _PROVIDER_OUTPUTS: dict[str, str] = {"github": ".github/workflows/ci.yml"}
+
+# Pinned in one place because the checkout version used to live in the template
+# while every other action lived here, so a bump could silently miss one.
+# The actions/* family moved to Node 24 in v7; v4/v5 now emit a deprecation
+# warning on every run.
+ACTIONS: dict[str, str] = {
+    "checkout": "actions/checkout@v7",
+    "setup-python": "actions/setup-python@v7",
+    "setup-node": "actions/setup-node@v7",
+    "setup-go": "actions/setup-go@v7",
+    "upload-artifact": "actions/upload-artifact@v7",
+    # Third-party actions are left at the versions we have actually run.
+    "pnpm": "pnpm/action-setup@v4",
+    "paths-filter": "dorny/paths-filter@v3",
+    "rust-toolchain": "dtolnay/rust-toolchain@stable",
+    "rust-cache": "Swatinem/rust-cache@v2",
+    "buildx": "docker/setup-buildx-action@v3",
+    "docker-build": "docker/build-push-action@v6",
+}
 
 
 # Every step and job is rendered with this key set so StrictUndefined can stay on.
@@ -144,7 +163,7 @@ def _python_job(detection: Mapping[str, Any], root: Path, prefix: str = "") -> d
     steps: list[dict[str, Any]] = [
         {
             "name": "Set up Python ${{ matrix.python-version }}",
-            "uses": "actions/setup-python@v5",
+            "uses": ACTIONS["setup-python"],
             "params": {
                 "python-version": "${{ matrix.python-version }}",
                 **_cache_params(prefix, dependency_file, "pip"),
@@ -202,7 +221,7 @@ def _node_job(detection: Mapping[str, Any], root: Path, prefix: str = "") -> dic
         steps.append(
             {
                 "name": "Set up pnpm",
-                "uses": "pnpm/action-setup@v4",
+                "uses": ACTIONS["pnpm"],
                 "params": {"version": _quote("9")},
             }
         )
@@ -210,7 +229,7 @@ def _node_job(detection: Mapping[str, Any], root: Path, prefix: str = "") -> dic
     steps.append(
         {
             "name": "Set up Node ${{ matrix.node-version }}",
-            "uses": "actions/setup-node@v4",
+            "uses": ACTIONS["setup-node"],
             "params": {
                 "node-version": "${{ matrix.node-version }}",
                 **_cache_params(prefix, lockfile, manager),
@@ -251,8 +270,8 @@ def _rust_job() -> dict[str, Any]:
         "name": "Rust",
         "matrix": None,
         "steps": [
-            {"name": "Set up Rust", "uses": "dtolnay/rust-toolchain@stable"},
-            {"name": "Cache cargo", "uses": "Swatinem/rust-cache@v2"},
+            {"name": "Set up Rust", "uses": ACTIONS["rust-toolchain"]},
+            {"name": "Cache cargo", "uses": ACTIONS["rust-cache"]},
             {"name": "Check formatting", "run": "cargo fmt --check"},
             {"name": "Clippy", "run": "cargo clippy -- -D warnings"},
             {"name": "Run tests", "run": "cargo test --all-features"},
@@ -268,7 +287,7 @@ def _go_job() -> dict[str, Any]:
         "steps": [
             {
                 "name": "Set up Go",
-                "uses": "actions/setup-go@v5",
+                "uses": ACTIONS["setup-go"],
                 "params": {"go-version": _quote("stable")},
             },
             {"name": "Vet", "run": "go vet ./..."},
@@ -283,10 +302,10 @@ def _docker_job() -> dict[str, Any]:
         "name": "Docker build",
         "matrix": None,
         "steps": [
-            {"name": "Set up Buildx", "uses": "docker/setup-buildx-action@v3"},
+            {"name": "Set up Buildx", "uses": ACTIONS["buildx"]},
             {
                 "name": "Build image",
-                "uses": "docker/build-push-action@v6",
+                "uses": ACTIONS["docker-build"],
                 "params": {
                     "context": _quote("."),
                     "push": "false",
@@ -334,7 +353,7 @@ def _changes_job(paths_by_slug: dict[str, str]) -> dict[str, Any]:
         "steps": [
             {
                 "name": "Filter changed paths",
-                "uses": "dorny/paths-filter@v3",
+                "uses": ACTIONS["paths-filter"],
                 "step_id": "filter",
                 "params": {"filters": filters},
             }
@@ -397,6 +416,7 @@ def build_context(
         jobs = [_changes_job(paths_by_slug), *jobs, *workspace_jobs]
 
     return {
+        "checkout_action": ACTIONS["checkout"],
         "workflow_name": workflow_name,
         "default_branch": default_branch,
         "version": version,
