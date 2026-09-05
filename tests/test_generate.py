@@ -7,7 +7,7 @@ import pytest
 import yaml
 
 from piper.errors import PiperError
-from piper.generate import build_context, default_output_path, generate, render
+from piper.generate import ACTIONS, build_context, default_output_path, generate, render
 
 from .conftest import ProjectBuilder
 
@@ -68,7 +68,7 @@ class TestRenderedYaml:
     def test_checkout_is_always_the_first_step(self, make_project: ProjectBuilder) -> None:
         root = make_project({"pyproject.toml": "[project]\n"})
         workflow = _load(render(PYTHON_DETECTION, root=str(root)))
-        assert workflow["jobs"]["python"]["steps"][0]["uses"] == "actions/checkout@v4"
+        assert workflow["jobs"]["python"]["steps"][0]["uses"] == "actions/checkout@v7"
 
     def test_pytest_step_present_when_runner_detected(self, make_project: ProjectBuilder) -> None:
         root = make_project({"pyproject.toml": "[project]\n"})
@@ -107,7 +107,7 @@ class TestNodeJob:
         root = make_project({"package.json": {"name": "x"}, "pnpm-lock.yaml": ""})
         workflow = _load(render(NODE_DETECTION, root=str(root)))
         uses = [step.get("uses") for step in workflow["jobs"]["node"]["steps"]]
-        assert uses.index("pnpm/action-setup@v4") < uses.index("actions/setup-node@v4")
+        assert uses.index("pnpm/action-setup@v4") < uses.index("actions/setup-node@v7")
 
     def test_frozen_lockfile_install(self, make_project: ProjectBuilder) -> None:
         root = make_project({"package.json": {"name": "x"}, "pnpm-lock.yaml": ""})
@@ -342,3 +342,30 @@ class TestSetupCaching:
         ][1]
         assert "cache" not in setup["with"]
         assert "cache-dependency-path" not in setup["with"]
+
+
+class TestActionVersions:
+    def test_checkout_comes_from_the_actions_map(self, make_project: ProjectBuilder) -> None:
+        """The template used to hardcode checkout, so a bump here could miss it."""
+        root = make_project({"pyproject.toml": "[project]\n"})
+        workflow = _load(render(PYTHON_DETECTION, root=str(root)))
+        step = workflow["jobs"]["python"]["steps"][0]
+        assert step["uses"] == ACTIONS["checkout"]
+
+    def test_no_first_party_action_is_left_on_a_node20_major(self) -> None:
+        """actions/* moved to Node 24 at v7; v4 and v5 warn on every run."""
+        stale = {
+            name: ref
+            for name, ref in ACTIONS.items()
+            if ref.startswith("actions/") and ref.rsplit("@v", 1)[-1] in {"3", "4", "5", "6"}
+        }
+        assert stale == {}
+
+    def test_every_rendered_action_is_declared(self, monorepo: Path) -> None:
+        """Nothing may reach the output without going through ACTIONS."""
+        workflow = _load(render(MONOREPO_DETECTION, root=str(monorepo)))
+        declared = set(ACTIONS.values())
+        for job in workflow["jobs"].values():
+            for step in job["steps"]:
+                if "uses" in step:
+                    assert step["uses"] in declared, step["uses"]
