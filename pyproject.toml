@@ -13,7 +13,7 @@ dependencies = [
   "rich>=13.7",
   "pyyaml>=6.0",
   "jinja2>=3.1",
-  "pathspec>=0.12",
+  "pathspec>=1.0",
   "tomli>=2.0; python_version<'3.11'",
   "tomli-w>=1.0"
 ]
@@ -21,27 +21,50 @@ dependencies = [
 [project.scripts]
 piper = "piper.cli:main"
 
+# Explicit discovery: relying on setuptools auto-discovery silently breaks
+# the moment anything else lands in src/.
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+piper = ["templates/*.j2"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "mypy>=1.11",
+  "ruff>=0.6",
+  "black>=24.8",
+  "pre-commit>=3.8",
+  "types-PyYAML>=6.0",
+]
+
 [tool.black]
 line-length = 100
+target-version = ["py310"]
 
 [tool.isort]
 profile = "black"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["venv", ".venv", "build", "dist", "*.egg-info"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
 
 [tool.pytest.ini_options]
 addopts = "-q"
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 mypy_path = ["src"]
-packages = ["piper"]
 files = ["src", "tests"]
 exclude = '^(venv|\.venv|build|dist|.*egg-info|\.mypy_cache|\.ruff_cache)/'
 strict = true
 
 [[tool.mypy.overrides]]
-module = ["rich.*"]
+module = ["rich.*", "tomli"]
 ignore_missing_imports = true
-
-[project.scripts]
-piper = "piper.cli:main"

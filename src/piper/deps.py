@@ -1,56 +1,136 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
-__all__ = ["run", "install_for"]
+from .errors import CommandFailedError, MissingToolError
+
+__all__ = ["run", "plan_install", "install_for", "plan_tests", "run_tests"]
+
+# Shown alongside "tool not found" so the message is actionable rather than just a complaint.
+_INSTALL_HINTS: dict[str, str] = {
+    "npm": "install Node.js from https://nodejs.org",
+    "pnpm": "run `corepack enable pnpm`",
+    "yarn": "run `corepack enable`",
+    "cargo": "install Rust from https://rustup.rs",
+    "go": "install Go from https://go.dev/dl",
+}
 
 
-def run(cmd: list[str], cwd: str | None = None) -> None:
-    subprocess.run(cmd, cwd=cwd, check=True)
+def run(cmd: list[str], cwd: str | None = None, dry_run: bool = False) -> None:
+    """
+    Execute a command, converting the two common failure modes into PiperErrors.
+
+    Without the PATH check a missing package manager surfaces as a bare
+    FileNotFoundError traceback, which tells the user nothing about what to install.
+    """
+    if dry_run:
+        return
+
+    executable = cmd[0]
+    # sys.executable is an absolute path to the running interpreter, so it needs no lookup.
+    if executable != sys.executable and shutil.which(executable) is None:
+        raise MissingToolError(executable, _INSTALL_HINTS.get(executable))
+
+    completed = subprocess.run(cmd, cwd=cwd, check=False)
+    if completed.returncode != 0:
+        raise CommandFailedError(cmd, completed.returncode)
 
 
-def install_for(detection: Dict[str, Any], cwd: str = ".") -> None:
-    types = detection.get("types", [])
+def _node_install_command(root: Path, package_manager: str | None) -> list[str] | None:
+    """Prefer a reproducible frozen-lockfile install; fall back to a plain install."""
+    if (root / "pnpm-lock.yaml").exists():
+        return ["pnpm", "install", "--frozen-lockfile"]
+    if (root / "yarn.lock").exists():
+        return ["yarn", "install", "--frozen-lockfile"]
+    if (root / "package-lock.json").exists():
+        return ["npm", "ci"]
+    if (root / "package.json").exists():
+        return [package_manager or "npm", "install"]
+    return None
+
+
+def plan_install(detection: Mapping[str, Any], cwd: str = ".") -> list[list[str]]:
+    """
+    Build the list of commands that ``install_for`` would run.
+
+    Keeping planning separate from execution means the interesting logic is testable
+    without spawning a single subprocess, and lets the CLI show a --dry-run preview.
+    """
+    types = detection.get("types") or []
     root = Path(cwd)
+    plan: list[list[str]] = []
 
     if "python" in types:
-        req = root / "requirements.txt"
-        if req.exists():
-            run(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
-                cwd=cwd,
+        if (root / "requirements.txt").exists():
+            plan.append(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]
             )
-            run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], cwd=cwd)
-        else:
-            pyproject = root / "pyproject.toml"
-            if pyproject.exists():
-                run([sys.executable, "-m", "pip", "install", "."], cwd=cwd)
+            plan.append([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+        elif (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+            plan.append([sys.executable, "-m", "pip", "install", "-e", "."])
 
     if "node" in types:
-        npm_lock = root / "package-lock.json"
-        pnpm_lock = root / "pnpm-lock.yaml"
-        yarn_lock = root / "yarn.lock"
+        command = _node_install_command(root, detection.get("package_manager"))
+        if command is not None:
+            plan.append(command)
 
-        if npm_lock.exists():
-            run(["npm", "ci"], cwd=cwd)
-        elif pnpm_lock.exists():
-            run(["pnpm", "install", "--frozen-lockfile"], cwd=cwd)
-        elif yarn_lock.exists():
-            run(["yarn", "install", "--frozen-lockfile"], cwd=cwd)
-        else:
-            pkg = root / "package.json"
-            if pkg.exists():
-                run(["npm", "install"], cwd=cwd)
+    if "rust" in types and (root / "Cargo.toml").exists():
+        plan.append(["cargo", "fetch"])
 
-    if "rust" in types:
-        cargo_toml = root / "Cargo.toml"
-        if cargo_toml.exists():
-            run(["cargo", "fetch"], cwd=cwd)
+    if "go" in types and (root / "go.mod").exists():
+        plan.append(["go", "mod", "download"])
 
-    if "go" in types:
-        go_mod = root / "go.mod"
-        if go_mod.exists():
-            run(["go", "mod", "download"], cwd=cwd)
+    return plan
+
+
+def install_for(
+    detection: Mapping[str, Any], cwd: str = ".", dry_run: bool = False
+) -> list[list[str]]:
+    """Install dependencies for every detected technology. Returns the commands used."""
+    plan = plan_install(detection, cwd)
+    for command in plan:
+        run(command, cwd=cwd, dry_run=dry_run)
+    return plan
+
+
+def plan_tests(detection: Mapping[str, Any], cwd: str = ".") -> list[list[str]]:
+    """Build the list of test commands implied by the detected test runners."""
+    runners = detection.get("test_runners") or []
+    package_manager = detection.get("package_manager") or "npm"
+    root = Path(cwd)
+    plan: list[list[str]] = []
+
+    if "pytest" in runners:
+        plan.append([sys.executable, "-m", "pytest"])
+
+    for runner in ("vitest", "jest", "mocha"):
+        if runner in runners:
+            # `npm test` respects whatever the project wired up in its scripts block.
+            plan.append([package_manager, "test"] if package_manager != "npm" else ["npm", "test"])
+            break
+
+    if "playwright" in runners:
+        plan.append(["npx", "playwright", "test"])
+
+    if "cargo-test" in runners and (root / "Cargo.toml").exists():
+        plan.append(["cargo", "test"])
+
+    if "go-test" in runners and (root / "go.mod").exists():
+        plan.append(["go", "test", "./..."])
+
+    return plan
+
+
+def run_tests(
+    detection: Mapping[str, Any], cwd: str = ".", dry_run: bool = False
+) -> list[list[str]]:
+    """Run every detected test suite. Returns the commands used."""
+    plan = plan_tests(detection, cwd)
+    for command in plan:
+        run(command, cwd=cwd, dry_run=dry_run)
+    return plan
